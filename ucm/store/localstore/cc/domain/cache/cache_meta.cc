@@ -50,26 +50,36 @@ CacheMeta::~CacheMeta()
 
 Status CacheMeta::Setup(const Index capacity) noexcept
 {
-    this->index_.Setup(capacity);
-    this->hash_.Setup(capacity);
+    // CacheMeta包含索引和哈希表
+    this->index_.Setup(capacity);   // 分配与释放
+    this->hash_.Setup(capacity);    // 插入与查找与删除
     this->size_ = this->index_.MemorySize() + this->hash_.MemorySize();
+    // 创建一个文件，用于存储CacheMeta
     auto file = File::Make(CacheLayout::MetaShmFile());
     if (!file) { return Status::OutOfMemory(); }
+    // flag 用于判断是否是第一次创建CacheMeta
     auto openFlags = IFile::OpenFlag::CREATE | IFile::OpenFlag::EXCL | IFile::OpenFlag::READ_WRITE;
     auto status = file->ShmOpen(openFlags);
+    // 多进程共享的文件，只有一个进程能创建成功
+    // 如果是第一次创建CacheMeta，那么需要初始化CacheMeta
     if (status.Success()) { return this->InitShmMeta(file.get()); }
+    // 如果是第二次创建CacheMeta，那么需要加载CacheMeta
     if (status == Status::DuplicateKey()) { return this->LoadShmMeta(file.get()); }
     return status;
 }
 
 CacheMeta::Index CacheMeta::Alloc(const std::string& id, const size_t offset) noexcept
 {
+    // 调用CacheIndex的Acquire方法，尝试分配一个槽位
     auto index = this->index_.Acquire();
     if (index != CacheIndex::npos) {
+        // index分配成功则在hash表中插入一个节点
         this->hash_.Insert(id, offset, index);
         return index;
     }
+    // index没分配成功说明满了，需要淘汰一个槽位
     auto evict = this->hash_.Evict();
+    // 淘汰成功把索引表的槽位释放
     if (evict != CacheHash::npos) { this->index_.Release(evict); }
     return npos;
 }
@@ -89,24 +99,30 @@ void CacheMeta::PutRef(const std::string& id, const size_t offset) noexcept
 
 Status CacheMeta::InitShmMeta(IFile* shmMetaFile)
 {
+    // 初始化CacheMeta的文件大小
     auto status = shmMetaFile->Truncate(this->size_);
     if (status.Failure()) { return status; }
+    // 把共享内存文件映射到本进程的虚拟地址空间
     status = shmMetaFile->MMap(this->addr_, this->size_, true, true, true);
     if (status.Failure()) { return status; }
     auto header = (Header*)this->addr_;
+    // 计算 index 和 hash 的起始地址
     auto indexBase = (void*)(((uint8_t*)this->addr_) + sizeof(Header));
     auto hashBase = (void*)(((uint8_t*)indexBase) + this->index_.MemorySize());
+    // 初始化index和hash
     this->index_.Setup(indexBase);
     this->hash_.Setup(hashBase);
     header->padding = 0;
     auto reservedSize = sizeof(header->reserved) / sizeof(*header->reserved);
     std::fill_n(header->reserved, reservedSize, 0);
+    // 写入魔数，用于校验是否初始化过
     header->magic = Magic;
     return Status::OK();
 }
 
 Status CacheMeta::LoadShmMeta(IFile* shmMetaFile)
 {
+    // 打开共享内存文件
     auto openFlags = IFile::OpenFlag::READ_WRITE;
     auto status = shmMetaFile->ShmOpen(openFlags);
     if (status.Failure()) { return status; }
@@ -114,6 +130,7 @@ Status CacheMeta::LoadShmMeta(IFile* shmMetaFile)
     constexpr auto maxTryTime = 100;
     auto tryTime = 0;
     IFile::FileStat stat;
+    // 等待共享内存文件大小与CacheMeta的大小一致，也就是等待某个进程执行truncate文件完成
     do {
         if (tryTime > maxTryTime) {
             UC_ERROR("Shm file({}) not ready.", shmMetaFile->Path());
@@ -124,10 +141,12 @@ Status CacheMeta::LoadShmMeta(IFile* shmMetaFile)
         if (status.Failure()) { return status; }
         tryTime++;
     } while (static_cast<size_t>(stat.st_size) != this->size_);
+    // 把共享内存文件映射到本进程的虚拟地址空间
     status = shmMetaFile->MMap(this->addr_, this->size_, true, true, true);
     if (status.Failure()) { return status; }
     auto header = (Header*)this->addr_;
     tryTime = 0;
+    // 等待共享内存文件初始化完成，也就是等待某个进程执行InitShmMeta完成
     do {
         if (header->magic == Magic) { break; }
         if (tryTime > maxTryTime) {
@@ -139,6 +158,7 @@ Status CacheMeta::LoadShmMeta(IFile* shmMetaFile)
     } while (true);
     auto indexBase = (void*)(((uint8_t*)this->addr_) + sizeof(Header));
     auto hashBase = (void*)(((uint8_t*)indexBase) + this->index_.MemorySize());
+    // 初始化index和hash，拿到地址空间
     this->index_.Setup(indexBase);
     this->hash_.Setup(hashBase);
     return Status::OK();
